@@ -161,7 +161,12 @@ def main(argv=None):
     if args.publish and release["draft"]:
         release = api(release_api, token, "PATCH", {"draft": False, "make_latest": "false"})
     if args.verify_public:
+        # Draft upload responses can contain an untagged URL. Publication changes
+        # the download path, so resolve the authoritative asset URLs again.
+        release = api(release_api, token)
+        published_assets = {item["id"]: item for item in release["assets"]}
         for asset, size, sha in verified:
+            asset = published_assets[asset["id"]]
             verify_download(asset["browser_download_url"], sha, size, attempts=6)
             print("PUBLIC_DOWNLOAD_VERIFIED " + asset["browser_download_url"])
     elif not args.publish and release["draft"]:
