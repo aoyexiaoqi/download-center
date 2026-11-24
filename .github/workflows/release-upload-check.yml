@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/release-upload-check.yml
+      - tools/release_upload.py
 
 permissions:
   contents: write
