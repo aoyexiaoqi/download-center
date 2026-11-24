@@ -2,6 +2,7 @@
 """Upload Release assets with explicit authentication and SHA-256 round-trip checks.
 
 python3 tools/release_upload.py --repo OWNER/REPO --tag TAG --publish FILE...
+Add --diagnose to check files, hosts, credentials and the target without writing.
 Authentication: GH_TOKEN, GITHUB_TOKEN, or an existing `gh auth login` session.
 Existing assets are verified and reused; different bytes are never overwritten.
 """
@@ -94,11 +95,80 @@ def verify_download(url, expected_sha, expected_size, token=None, attempts=1):
             time.sleep(min(2 ** attempt, 8))
 
 
+def diagnose(args, files):
+    """Check every independent prerequisite, even if an earlier check fails."""
+    failures = []
+
+    def fail(label, message):
+        failures.append(label)
+        print(f"[失败] {label} · {message}")
+
+    for path in files:
+        try:
+            if not path.is_file():
+                raise ValueError("没有找到普通文件")
+            with path.open("rb") as source:
+                if not source.read(1):
+                    raise ValueError("文件为空")
+            print(f"[通过] {path} · {path.stat().st_size} 字节")
+        except (OSError, ValueError) as error:
+            fail(str(path), error)
+    if len({p.name for p in files}) != len(files):
+        fail("附件名称", "多个文件使用相同的附件名")
+
+    reachable = set()
+    for host in ("api.github.com", "uploads.github.com"):
+        try:
+            request = urllib.request.Request("https://" + host + "/", method="HEAD")
+            with OPENER.open(request, timeout=10):
+                pass
+        except urllib.error.HTTPError as error:
+            # The uploads host may return 404 at its root; it still answered HTTPS.
+            if error.code == 407 or error.code >= 500:
+                fail(host, f"HTTP {error.code}")
+                continue
+        except (OSError, UploadError) as error:
+            fail(host, str(error))
+            continue
+        reachable.add(host)
+        print(f"[通过] {host} · HTTPS 可达")
+
+    try:
+        token = token_from_environment()
+    except UploadError:
+        token = None
+        fail("上传凭据", "未取得 GH_TOKEN、GITHUB_TOKEN 或已登录的 gh 凭据")
+    if token and "api.github.com" in reachable:
+        base = "https://api.github.com/repos/" + args.repo
+        try:
+            repo = api(base, token)
+            print(f"[通过] 仓库可读 · {repo['full_name']}")
+            if args.release_id:
+                release = api(base + "/releases/" + str(args.release_id), token)
+                if release["tag_name"] != args.tag:
+                    fail("Release", f"实际标签为 {release['tag_name']}，预期为 {args.tag}")
+                else:
+                    state = "草稿" if release["draft"] else "已发布"
+                    print(f"[通过] Release · {state}，{len(release['assets'])} 个附件")
+        except urllib.error.HTTPError as error:
+            hint = {401: "GitHub 拒绝了当前凭据，请在此机器更新登录",
+                    403: "检查仓库授权、限流和组织策略",
+                    404: "检查仓库、草稿 ID 及凭据的访问权限"}
+            fail("GitHub API", f"HTTP {error.code} · " + hint.get(error.code, "请求失败"))
+        except (OSError, ValueError, KeyError, UploadError) as error:
+            fail("GitHub API", str(error))
+    else:
+        print("[跳过] 仓库和草稿读取需要可用的 API 和凭据")
+    print("只读诊断完成。附件写入权限和下载链接由实际上传验证。")
+    return 1 if failures else 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--title")
+    parser.add_argument("--diagnose", action="store_true", help="Check prerequisites without uploading or publishing")
     parser.add_argument("--release-id", type=int, help="Resume an existing draft by its numeric release ID")
     parser.add_argument("--publish", action="store_true", help="Publish only after every asset passes its download check")
     parser.add_argument("--prerelease", action="store_true")
@@ -107,9 +177,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
         raise UploadError("--repo must be OWNER/REPO")
+    files = [Path(item).expanduser().resolve() for item in args.files]
+    if args.diagnose:
+        return diagnose(args, files)
     if args.verify_public and not args.publish:
         raise UploadError("--verify-public requires --publish")
-    files = [Path(item).expanduser().resolve() for item in args.files]
     for path in files:
         if not path.is_file() or path.stat().st_size == 0:
             raise UploadError("Missing or empty source file: " + str(path))
